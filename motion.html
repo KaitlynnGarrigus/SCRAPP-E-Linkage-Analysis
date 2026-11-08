@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Motion & code · Robot Design Lab</title><link rel="stylesheet" href="style.css"></head>
+<body data-page="motion"><div id="nav"></div><main class="wrap">
+<h1>Motion Designer &amp; Code Generator</h1>
+<p class="s">Load your CAD parts, place the motors, pose and name movements, then generate code for your board.</p>
+<div class="card"><h2>1 · CAD parts</h2><input type="file" id="fl" accept=".stl" multiple> <span id="pl" class="n"></span>
+<p class="n">A browser can't open SolidWorks files (.sldprt/.sldasm). In SolidWorks use File → Save As → STL (binary). For an assembly, untick “Save all components of an assembly in a single file” so each part saves as its own STL and keeps its position. Then load one STL per moving part. If the export loses the assembly positions or mates, rebuild them in step 3.</p></div>
+<div class="g" style="align-items:flex-start"><div style="flex:1 1 460px;min-width:0"><div class="card"><h2>2 · Model</h2><div id="mv" style="height:400px;border:1px solid var(--bd);border-radius:6px;overflow:hidden"></div>
+<p class="n">Drag to orbit, wheel to zoom. Orange dots are motor pivots (the selected one is red). <span id="mm"></span></p></div>
+<div class="card"><h2>3 · Assembly mates</h2>
+<p class="n">Only needed if your STL export lost the assembly positions or mates. Choose a mate type, press Pick, then click a face on the model. Flat and cylindrical faces are detected automatically. Mate each new part to one that is already placed, starting from the base, because mates are applied in order.</p>
+<div class="g" style="align-items:end"><label>Mate type<select id="mty"><option value="coincident">Coincident (flat to flat)</option><option value="distance">Distance (flat to flat)</option><option value="concentric">Concentric (cylinder to cylinder)</option><option value="hinge">Hinge (concentric + optional stop faces)</option></select></label>
+<label>Offset (mm)<input id="mof" type="number" value="0"></label><label style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" id="mfl"> Flip (face the same way)</label></div>
+<div id="ms" style="margin:8px 0"></div>
+<div class="row"><button id="mad">Add mate</button><button id="mcl" class="ghost">Clear all mates</button></div>
+<div class="w"><table id="mtab" style="margin-top:10px"></table></div>
+<p class="n">A hinge mate defines a rotation axis and pivot. Press “Make motor” on it to create a motor that rotates the moving part about that axis (it follows the hinge if you edit the mates).</p></div>
+</div>
+<div class="card" style="flex:1 1 460px;min-width:0"><h2>4 · Motors</h2><div id="mt"></div><button id="am">+ Add motor</button>
+<p class="n">Pose slider angles are relative to the home pose (0°). Servos treat 0° as their centre.</p></div></div>
+<div class="card"><h2>5 · Movements</h2>
+<div class="g" style="align-items:end"><label>Movement name<input id="mn" placeholder="Head Tilt Left"></label><label>Duration (ms)<input id="md" type="number" value="800" style="width:80px"></label><button id="mr">Record current pose as movement</button><button id="ph" class="sm">Go home</button><button id="pa" class="sm">Play all</button></div>
+<p class="n" style="margin:8px 0 2px">Motors included in this movement (unchecked motors hold their position):</p><div id="mj" class="g"></div><div class="w"><table id="ml" style="margin-top:8px"></table></div></div>
+<div class="card"><h2>6 · Generate code</h2><div class="g" style="align-items:end"><label>Board<select id="bd"><option value="uno">Arduino Uno</option><option value="mega">Arduino Mega 2560</option><option value="esp32">ESP32</option><option value="esp32s3">ESP32-S3</option><option value="pi5">Raspberry Pi 5</option></select></label>
+<label>Language<select id="lg"><option value="cpp">C++ (Arduino)</option><option value="python">Python (Pi 5 / MicroPython)</option><option value="java">Java (Pi 5, Pi4J)</option></select></label>
+<button id="gn">Generate code</button><button id="cp" class="sm">Copy</button><button id="dw" class="sm">Download</button></div>
+<div id="cw" class="n" style="margin:8px 0"></div><textarea id="co" rows="18" style="width:100%;font-family:monospace;font-size:12px" readonly></textarea></div>
+</main>
+<script src="config.js"></script><script src="common.js"></script>
+<script>
+(()=>{
+const AX={X:[1,0,0],Y:[0,1,0],Z:[0,0,1]};
+const TYPES={servo180:{n:'Servo 180°',r:180},servo270:{n:'Servo 270°',r:270},nema17:{n:'NEMA 17 stepper (STEP/DIR driver)'},dc:{n:'DC motor (H-bridge)'}};
+const PINS={servo180:['signal'],servo270:['signal'],nema17:['step','dir','en'],dc:['pwm','in1','in2']};
+const BN={uno:'Arduino Uno',mega:'Arduino Mega 2560',esp32:'ESP32',esp32s3:'ESP32-S3',pi5:'Raspberry Pi 5'};
+let meshOf={},slots=[],faceSlot=-1,mates=[],mid=1,parts=[],M=[],MV=[],ang=[],sel=0,pick=false,ready3=null,sc,cam,ren,root,grp=[],orb={th:.8,ph:1.1,d:300,c:[0,0,0],size:100};
+const esc=t=>String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const need3=()=>window.THREE?Promise.resolve():new Promise(ok=>{const s=document.createElement('script');s.src='https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';s.onload=ok;document.head.appendChild(s)});
+function parseSTL(buf){const dv=new DataView(buf),n=dv.getUint32(80,true);
+ if(84+n*50===buf.byteLength){const p=new Float32Array(n*9);for(let i=0;i<n;i++)for(let k=0;k<9;k++)p[i*9+k]=dv.getFloat32(84+i*50+12+((k/3)|0)*12+(k%3)*4,true);return p}
+ const m=[...new TextDecoder().decode(buf).matchAll(/vertex\s+(\S+)\s+(\S+)\s+(\S+)/g)],p=new Float32Array(m.length*3);m.forEach((a,i)=>{p[i*3]=+a[1];p[i*3+1]=+a[2];p[i*3+2]=+a[3]});return p}
+const init3d=()=>ready3||(ready3=need3().then(()=>{
+ const el=$('mv'),w=el.clientWidth||600;sc=new THREE.Scene();sc.background=new THREE.Color(0x14181e);cam=new THREE.PerspectiveCamera(45,w/400,.1,1e6);
+ ren=new THREE.WebGLRenderer({antialias:true});ren.setSize(w,400);el.appendChild(ren.domElement);
+ sc.add(new THREE.AmbientLight(0xffffff,.55));const dl=new THREE.DirectionalLight(0xffffff,.9);dl.position.set(1,2,1.5);sc.add(dl);root=new THREE.Group();sc.add(root);
+ const cv=ren.domElement;let dn=null;
+ cv.onpointerdown=e=>{dn={x:e.clientX,y:e.clientY,m:0};cv.setPointerCapture(e.pointerId)};
+ cv.onpointermove=e=>{if(!dn)return;const dx=e.clientX-dn.x,dy=e.clientY-dn.y;dn.m+=Math.abs(dx)+Math.abs(dy);dn.x=e.clientX;dn.y=e.clientY;orb.th-=dx*.008;orb.ph=Math.max(.05,Math.min(3.09,orb.ph-dy*.008))};
+ cv.onpointerup=e=>{if(dn&&dn.m<5&&(pick||faceSlot>=0))place(e);dn=null};cv.onpointercancel=()=>{dn=null};
+ cv.onwheel=e=>{e.preventDefault();orb.d*=e.deltaY>0?1.1:.9};
+ (function loop(){requestAnimationFrame(loop);const[x,y,z]=orb.c,d=orb.d;
+  cam.position.set(x+d*Math.sin(orb.ph)*Math.sin(orb.th),y+d*Math.cos(orb.ph),z+d*Math.sin(orb.ph)*Math.cos(orb.th));cam.lookAt(x,y,z);ren.render(sc,cam)})();
+ rebuild()}));
+function place(e){const r=ren.domElement.getBoundingClientRect(),rc=new THREE.Raycaster();
+ rc.setFromCamera(new THREE.Vector2((e.clientX-r.left)/r.width*2-1,-((e.clientY-r.top)/r.height)*2+1),cam);
+ const h=rc.intersectObjects(root.children,true).find(x=>!x.object.userData.mk);if(!h)return;
+ if(faceSlot>=0){pickFace(h);return}const p=h.object.worldToLocal(h.point.clone());if(h.object.userData.part)p.applyMatrix4(h.object.userData.part.xf);M[sel].pivot=[p.x,p.y,p.z].map(v=>+v.toFixed(2));pick=false;ren.domElement.style.cursor='';$('mm').textContent='';rebuild();mui()}
+function rebuild(){if(!root)return;while(root.children.length)root.remove(root.children[0]);meshOf={};grp=M.map(()=>new THREE.Group());
+ const cols=[0x7aa2d6,0x8fbf8f,0xd6a77a,0xb28fd6,0xd67a7a,0x7ad6c9];parts.forEach(p=>{p.used=false});
+ M.forEach((m,i)=>{const par=m.parent>=0&&m.parent<i?m.parent:-1,pp=par>=0?M[par].pivot:[0,0,0];
+  grp[i].position.set(m.pivot[0]-pp[0],m.pivot[1]-pp[1],m.pivot[2]-pp[2]);(par>=0?grp[par]:root).add(grp[i]);
+  const p=parts.find(x=>x.name==m.part);
+  if(p){p.used=true;const me=new THREE.Mesh(p.geo,new THREE.MeshPhongMaterial({color:cols[i%6],side:THREE.DoubleSide}));me.matrixAutoUpdate=false;me.matrix.makeTranslation(-m.pivot[0],-m.pivot[1],-m.pivot[2]).multiply(p.xf);me.matrixWorldNeedsUpdate=true;me.userData.part=p;meshOf[p.name]=me;grp[i].add(me)}
+  const mk=new THREE.Mesh(new THREE.SphereGeometry(orb.size*.025,12,8),new THREE.MeshBasicMaterial({color:i==sel?0xff3030:0xffb020,depthTest:false}));mk.renderOrder=9;mk.userData.mk=1;grp[i].add(mk)});
+ parts.filter(p=>!p.used).forEach(p=>{const me=new THREE.Mesh(p.geo,new THREE.MeshPhongMaterial({color:0x9aa3ad,side:THREE.DoubleSide}));me.matrixAutoUpdate=false;me.matrix.copy(p.xf);me.matrixWorldNeedsUpdate=true;me.userData.part=p;meshOf[p.name]=me;root.add(me)});
+ slots.forEach(d=>{const pt=d&&parts.find(x=>x.name==d.part),me=pt&&meshOf[d.part];if(!me||!d.tris)return;const arr=new Float32Array(d.tris.length*9);d.tris.forEach((t,k)=>arr.set(pt.pos.subarray(t*9,t*9+9),k*9));
+  const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(arr,3));const o=new THREE.Mesh(g,new THREE.MeshBasicMaterial({color:0x22d3ee,side:THREE.DoubleSide,polygonOffset:true,polygonOffsetFactor:-2,polygonOffsetUnits:-2}));o.userData.mk=1;me.add(o)});pose()}
+function pose(){M.forEach((m,i)=>{if(grp[i])grp[i].quaternion.setFromAxisAngle(new THREE.Vector3(...(m.axis=='custom'&&m.ax?m.ax:AX[m.axis])),(ang[i]||0)*Math.PI/180)})}
+function fit(){if(!parts.length)return;const b=new THREE.Box3(),c=new THREE.Vector3(),s=new THREE.Vector3();parts.forEach(p=>b.union(p.geo.boundingBox.clone().applyMatrix4(p.xf)));b.getCenter(c);b.getSize(s);orb.c=[c.x,c.y,c.z];orb.size=s.length();orb.d=orb.size*1.6;rebuild()}
+$('fl').onchange=async e=>{await need3();
+ for(const f of e.target.files){const p=parseSTL(await f.arrayBuffer()),g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(p,3));g.computeVertexNormals();g.computeBoundingBox();parts=parts.filter(x=>x.name!=f.name);parts.push({name:f.name,geo:g,tris:p.length/9,pos:p,xf:new THREE.Matrix4()})}
+ $('pl').textContent=parts.map(p=>`${p.name} (${p.tris} triangles)`).join(', ');await init3d();solve();fit();mui();mtl();msl()};
+const inp=(i,f,l,v,t,w)=>`<label>${l}<input data-i="${i}" data-f="${f}" type="${t||'text'}" ${t=='number'?'step="any"':''} value="${esc(v==null?'':v)}" style="width:${w||78}px"></label>`;
+const sl=(i,f,l,o,v,fm)=>`<label>${l}<select data-i="${i}" data-f="${f}">${o.map(k=>`<option value="${k}"${k==v?' selected':''}>${esc(fm?fm(k):k)}</option>`).join('')}</select></label>`;
+function mui(){$('mt').innerHTML=M.length?M.map((m,i)=>{const t=m.type;
+ return `<div data-card="${i}" style="border:1px solid ${i==sel?'var(--ac)':'var(--bd)'};border-radius:6px;padding:8px;margin-bottom:8px"><div class="g">`
+ +inp(i,'name','Name',m.name,'text',100)+sl(i,'type','Motor',Object.keys(TYPES),t,k=>TYPES[k].n)
+ +sl(i,'part','Moves part',['',...parts.map(p=>p.name)],m.part,k=>k||'— none —')
+ +sl(i,'parent','Mounted on',[-1,...M.map((_,j)=>j).filter(j=>j<i)],m.parent,k=>k<0?'ground':M[k].name)
+ +sl(i,'axis','Axis',m.axis=='custom'?['custom','X','Y','Z']:['X','Y','Z'],m.axis,k=>k=='custom'?'From hinge mate':k)
+ +inp(i,'px','Pivot X',m.pivot[0],'number',62)+inp(i,'py','Y',m.pivot[1],'number',62)+inp(i,'pz','Z',m.pivot[2],'number',62)
+ +`<button class="sm" data-a="pick" data-i="${i}">Pick pivot on model</button>`
+ +inp(i,'min','Min °',m.min,'number',60)+inp(i,'max','Max °',m.max,'number',60)
+ +(t=='nema17'?sl(i,'micro','Microstep',[1,2,4,8,16,32],m.micro)+inp(i,'gear','Gear ratio',m.gear,'number',60):'')
+ +(t=='dc'?inp(i,'dps','°/s at full speed',m.dps,'number',70):'')
+ +PINS[t].map(k=>inp(i,'pin_'+k,k+' pin'+(k=='en'?' (optional)':''),m.pins[k],'text',70)).join('')
+ +`<button class="sm" data-a="del" data-i="${i}" style="background:var(--bad)">Remove</button></div>`
+ +`<label class="n" style="display:block;margin-top:6px">Pose: <span id="av${i}">${(ang[i]||0).toFixed(0)}°</span><input data-i="${i}" data-f="ang" type="range" min="${m.min}" max="${m.max}" step="1" value="${ang[i]||0}" style="width:100%"></label></div>`}).join(''):'<p class="n">No motors yet. Add one, assign a part, and place its pivot.</p>';
+ mvl()}
+$('mt').onclick=e=>{const t=e.target,i=+t.dataset.i,a=t.dataset.a,c=t.closest('[data-card]');
+ if(c&&+c.dataset.card!=sel){sel=+c.dataset.card;[...$('mt').children].forEach((d,k)=>{if(d.dataset.card!=null)d.style.borderColor=+d.dataset.card==sel?'var(--ac)':'var(--bd)'});rebuild()}
+ if(a=='pick'){pick=true;if(ren)ren.domElement.style.cursor='crosshair';$('mm').textContent='Click the model to place the pivot for "'+M[i].name+'".'}
+ if(a=='del'){M.splice(i,1);ang.splice(i,1);M.forEach(m=>{if(m.parent==i)m.parent=-1;else if(m.parent>i)m.parent--});MV.forEach(v=>v.t.splice(i,1));sel=Math.min(sel,Math.max(0,M.length-1));mui();rebuild()}};
+$('mt').oninput=$('mt').onchange=e=>{const t=e.target,i=+t.dataset.i,f=t.dataset.f;if(!f)return;const m=M[i],v=t.value;
+ if(f=='ang'){ang[i]=+v;pose();$('av'+i).textContent=(+v).toFixed(0)+'°';return}
+ if(f=='px'||f=='py'||f=='pz'){m.pivot['xyz'.indexOf(f[1])]=+v||0;rebuild();return}
+ if(f.startsWith('pin_')){m.pins[f.slice(4)]=v;return}
+ m[f]=['min','max','micro','gear','dps','parent'].includes(f)?+v:v;
+ if(f=='type'){const r=TYPES[v].r;m.min=r?-r/2:-180;m.max=r?r/2:180;ang[i]=0;mui();rebuild();return}
+ if(f=='min'||f=='max'){const s=document.querySelector(`[data-f="ang"][data-i="${i}"]`);s.min=m.min;s.max=m.max}
+ if(f=='part'||f=='parent'||f=='axis')rebuild();
+ if(f=='name')mvl()};
+$('am').onclick=()=>{M.push({name:'Motor '+(M.length+1),type:'servo180',part:'',parent:-1,axis:'Y',pivot:[0,0,0],min:-90,max:90,pins:{},micro:16,gear:1,dps:90});ang.push(0);MV.forEach(v=>v.t.push(null));sel=M.length-1;mui();rebuild()};
+function syncSl(){M.forEach((m,i)=>{const s=document.querySelector(`[data-f="ang"][data-i="${i}"]`);if(s){s.value=ang[i]||0;$('av'+i).textContent=(ang[i]||0).toFixed(0)+'°'}})}
+function anim(to,ms){const from=M.map((m,i)=>ang[i]||0),t0=performance.now(),tg=M.map((m,i)=>to[i]==null?from[i]:Math.max(m.min,Math.min(m.max,to[i])));
+ return new Promise(ok=>{(function s(){const f=ms>0?Math.min(1,(performance.now()-t0)/ms):1,e=f<.5?2*f*f:1-Math.pow(-2*f+2,2)/2;ang=from.map((a,i)=>a+(tg[i]-a)*e);pose();syncSl();f<1?requestAnimationFrame(s):ok()})()})}
+function mvl(){$('mj').innerHTML=M.map((m,i)=>`<label style="flex-direction:row;align-items:center;gap:4px"><input type="checkbox" data-inc="${i}" ${m.inc===false?'':'checked'}>${esc(m.name)}</label>`).join('');
+ $('ml').innerHTML=MV.length?'<tr><th>Name</th><th>Targets</th><th>ms</th><th></th></tr>'+MV.map((v,j)=>`<tr><td>${esc(v.name)}</td><td>${M.map((m,i)=>v.t[i]==null?'':esc(m.name)+' '+v.t[i]+'°').filter(Boolean).join(', ')}</td><td>${v.ms}</td><td><button class="sm" data-a="play" data-j="${j}">Play</button> <button class="sm" data-a="pose" data-j="${j}">Show pose</button> <button class="sm" data-a="del" data-j="${j}">Delete</button></td></tr>`).join(''):'<tr><td class="n">No movements recorded yet.</td></tr>'}
+$('mj').onchange=e=>{const i=e.target.dataset.inc;if(i!=null)M[i].inc=e.target.checked};
+$('mr').onclick=()=>{const name=$('mn').value.trim();if(!name){$('mn').focus();return}
+ const o={name,ms:+$('md').value||800,t:M.map((m,i)=>m.inc===false?null:+(ang[i]||0).toFixed(1))},k=MV.findIndex(v=>v.name.toLowerCase()==name.toLowerCase());if(k>=0)MV[k]=o;else MV.push(o);mvl()};
+$('ml').onclick=e=>{const j=+e.target.dataset.j,a=e.target.dataset.a;if(!a)return;
+ if(a=='play')anim(MV[j].t,MV[j].ms);
+ if(a=='pose'){ang=M.map((m,i)=>MV[j].t[i]==null?(ang[i]||0):MV[j].t[i]);pose();syncSl()}
+ if(a=='del'){MV.splice(j,1);mvl()}};
+$('pa').onclick=async()=>{for(const v of MV)await anim(v.t,v.ms)};
+$('ph').onclick=()=>anim(M.map(()=>0),600);
+// ---------- code generation ----------
+const P=m=>{const p=m.pins,g=k=>(p[k]||'').trim();return m.type=='nema17'?[g('step'),g('dir'),g('en')]:m.type=='dc'?[g('pwm'),g('in1'),g('in2')]:[g('signal'),'',''] };
+const KV=m=>m.type=='nema17'?+(200*m.micro*m.gear/360).toFixed(4):m.type=='dc'?m.dps:TYPES[m.type].r;
+const lim=m=>{const r=TYPES[m.type].r,h=r?r/2:1e9;return[Math.max(m.min,-h),Math.min(m.max,h)]};
+const snake=s=>{const r=s.replace(/[^A-Za-z0-9]+/g,' ').trim().split(' ').filter(Boolean).join('_').toLowerCase()||'move';return /^\d/.test(r)?'m_'+r:r};
+const ids=()=>{const u={};return MV.map(v=>{const b=snake(v.name);let k=b,n=1;while(u[k])k=b+'_'+(++n);u[k]=1;return 'do_'+k})};
+const nm=s=>s.replace(/["\\]/g,'');
+const pn=(s,none)=>s===''?none:(isNaN(+s)?s:+s);
+const T3={servo180:'servo',servo270:'servo',nema17:'stepper',dc:'dc'};
+function cpp(bd){const esp=bd.startsWith('esp'),f=a=>a.join(', '),I=ids(),pins=M.map(P),col=j=>f(pins.map(p=>pn(p[j],-1)));
+ const mvf=MV.map((v,j)=>`void ${I[j]}() { const float t[N] = {${f(M.map((m,i)=>v.t[i]==null?'NAN':v.t[i]))}}; moveTo(t, ${v.ms}); }  // ${nm(v.name)}`).join('\n');
+ const run=MV.length?MV.map((v,j)=>`if (s.equalsIgnoreCase("${nm(v.name)}")) ${I[j]}();`).join('\n  else ')+'\n  else Serial.println("Unknown movement");':'Serial.println("No movements defined");';
+ return `// Generated by SCRAPP-E Motion Designer | board: ${BN[bd]}
+// Open the Serial Monitor (115200 baud, newline) and type a movement name to run it.
+#include <Arduino.h>
+#include <${esp?'ESP32Servo':'Servo'}.h>${esp?'   // Library Manager: "ESP32Servo". DC PWM uses analogWrite (arduino-esp32 core 3.x)':''}
+
+const int N = ${M.length};
+// TYPE: 0 = hobby servo, 1 = NEMA 17 (STEP/DIR driver), 2 = DC motor (H-bridge)
+const uint8_t TYPE[N] = {${f(M.map(m=>({servo180:0,servo270:0,nema17:1,dc:2}[m.type])))}};
+const int P1[N] = {${col(0)}};  // servo: signal | stepper: STEP | DC: PWM
+const int P2[N] = {${col(1)}};  // stepper: DIR | DC: IN1
+const int P3[N] = {${col(2)}};  // stepper: EN (-1 = unused, active LOW) | DC: IN2
+const float K[N] = {${f(M.map(KV))}};  // servo: range (deg) | stepper: steps per degree | DC: deg/s at full speed
+const float LO[N] = {${f(M.map(m=>lim(m)[0]))}};
+const float HI[N] = {${f(M.map(m=>lim(m)[1]))}};  // joint limits (deg), 0 = home pose
+float pos[N];
+long stepsDone[N];
+Servo sv[N];
+
+int servoUs(int i, float a) { return 500 + (int)(2000.0f * (a + K[i] / 2) / K[i]); }
+
+void setupMotors() {
+  for (int i = 0; i < N; i++) {
+    pos[i] = 0; stepsDone[i] = 0;
+    if (TYPE[i] == 0) { sv[i].attach(P1[i], 500, 2500); sv[i].writeMicroseconds(servoUs(i, 0)); }
+    else if (TYPE[i] == 1) {
+      pinMode(P1[i], OUTPUT); pinMode(P2[i], OUTPUT);
+      if (P3[i] >= 0) { pinMode(P3[i], OUTPUT); digitalWrite(P3[i], LOW); }
+    } else { pinMode(P1[i], OUTPUT); pinMode(P2[i], OUTPUT); pinMode(P3[i], OUTPUT); }
+  }
+}
+
+// Move every motor to its target angle (NAN = hold) over ms milliseconds.
+void moveTo(const float* tgt, unsigned long ms) {
+  float s[N], g[N];
+  for (int i = 0; i < N; i++) { s[i] = pos[i]; g[i] = isnan(tgt[i]) ? pos[i] : constrain(tgt[i], LO[i], HI[i]); }
+  unsigned long t0 = millis(), last = t0;
+  while (true) {
+    unsigned long now = millis();
+    float f = ms ? min(1.0f, (float)(now - t0) / ms) : 1.0f, dt = (now - last) / 1000.0f;
+    last = now;
+    for (int i = 0; i < N; i++) {
+      float want = s[i] + (g[i] - s[i]) * f;
+      if (TYPE[i] == 0) { sv[i].writeMicroseconds(servoUs(i, want)); pos[i] = want; }
+      else if (TYPE[i] == 1) {
+        long need = lroundf(want * K[i]);
+        while (stepsDone[i] != need) {
+          bool up = need > stepsDone[i];
+          digitalWrite(P2[i], up); digitalWrite(P1[i], HIGH); delayMicroseconds(400);
+          digitalWrite(P1[i], LOW); delayMicroseconds(400); stepsDone[i] += up ? 1 : -1;
+        }
+        pos[i] = want;
+      } else {  // DC motor: no feedback, angle is estimated from run time
+        float e = want - pos[i];
+        if (fabsf(e) > 1.0f) { digitalWrite(P2[i], e > 0); digitalWrite(P3[i], e < 0); analogWrite(P1[i], 255); pos[i] += (e > 0 ? 1 : -1) * K[i] * dt; }
+        else { analogWrite(P1[i], 0); digitalWrite(P2[i], LOW); digitalWrite(P3[i], LOW); }
+      }
+    }
+    if (f >= 1.0f) break;
+    delay(5);
+  }
+  for (int i = 0; i < N; i++) { if (TYPE[i] == 2) analogWrite(P1[i], 0); pos[i] = g[i]; }
+}
+
+${mvf}
+
+void runByName(String s) {
+  s.trim();
+  ${run}
+}
+
+void setup() { Serial.begin(115200); setupMotors(); Serial.println("Ready. Type a movement name."); }
+void loop() { if (Serial.available()) runByName(Serial.readStringUntil('\\n')); }
+`}
+function py(bd){const pi=bd=='pi5',I=ids(),pins=M.map(P);
+ const mot=M.map((m,i)=>`    dict(name="${nm(m.name)}", type="${T3[m.type]}", pins=(${pins[i].map(p=>pn(p,'None')).join(', ')}), k=${KV(m)}, lo=${lim(m)[0]}, hi=${lim(m)[1]}),`).join('\n');
+ const hw=pi?`from gpiozero import Servo, OutputDevice, PWMOutputDevice
+import time
+
+def now_ms(): return time.monotonic() * 1000
+def sleep_ms(x): time.sleep(x / 1000)
+
+hw = []
+for m in MOTORS:
+    p = m["pins"]
+    if m["type"] == "servo":
+        hw.append(Servo(p[0], min_pulse_width=0.0005, max_pulse_width=0.0025, initial_value=0))
+    elif m["type"] == "stepper":
+        hw.append((OutputDevice(p[0]), OutputDevice(p[1]), OutputDevice(p[2], initial_value=False) if p[2] is not None else None))
+    else:
+        hw.append((PWMOutputDevice(p[0]), OutputDevice(p[1]), OutputDevice(p[2])))
+
+def servo_set(i, a): hw[i].value = max(-1, min(1, a / (MOTORS[i]["k"] / 2)))
+def stepper_step(i, up):
+    st, d, en = hw[i]
+    d.value = up; st.on(); time.sleep(0.0004); st.off(); time.sleep(0.0004)
+def dc_set(i, d, sp):
+    pw, a, b = hw[i]
+    a.value = d > 0; b.value = d < 0; pw.value = sp`:`from machine import Pin, PWM
+import time
+
+def now_ms(): return time.ticks_ms()
+def sleep_ms(x): time.sleep_ms(int(x))
+
+hw = []
+for m in MOTORS:
+    p = m["pins"]
+    if m["type"] == "servo":
+        hw.append(PWM(Pin(p[0]), freq=50))
+    elif m["type"] == "stepper":
+        hw.append((Pin(p[0], Pin.OUT), Pin(p[1], Pin.OUT), Pin(p[2], Pin.OUT, value=0) if p[2] is not None else None))
+    else:
+        hw.append((PWM(Pin(p[0]), freq=1000), Pin(p[1], Pin.OUT), Pin(p[2], Pin.OUT)))
+
+def servo_set(i, a): hw[i].duty_ns(int((1500 + 1000 * a / (MOTORS[i]["k"] / 2)) * 1000))
+def stepper_step(i, up):
+    st, d, en = hw[i]
+    d.value(1 if up else 0); st.value(1); time.sleep_us(400); st.value(0); time.sleep_us(400)
+def dc_set(i, d, sp):
+    pw, a, b = hw[i]
+    a.value(1 if d > 0 else 0); b.value(1 if d < 0 else 0); pw.duty_u16(int(sp * 65535))`;
+ const mvf=MV.map((v,j)=>`def ${I[j]}(): move_to([${M.map((m,i)=>v.t[i]==null?'None':v.t[i]).join(', ')}], ${v.ms})  # ${nm(v.name)}`).join('\n');
+ return `# Generated by SCRAPP-E Motion Designer | board: ${BN[bd]} (${pi?'gpiozero, BCM pin numbers':'MicroPython'})
+# Run it, then type a movement name at the prompt.
+N = ${M.length}
+# type: servo | stepper (STEP, DIR, EN) | dc (PWM, IN1, IN2). k: servo range deg | stepper steps/deg | dc deg/s at full speed
+MOTORS = [
+${mot}
+]
+
+${hw}
+
+pos = [0.0] * N
+steps = [0] * N
+
+def move_to(tgt, ms):
+    """Move all motors to target angles (None = hold) over ms milliseconds."""
+    s = pos[:]
+    g = [p if t is None else max(m["lo"], min(m["hi"], t)) for p, t, m in zip(pos, tgt, MOTORS)]
+    t0 = now_ms(); last = t0
+    while True:
+        n = now_ms(); f = min(1.0, (n - t0) / ms) if ms else 1.0; dt = (n - last) / 1000; last = n
+        for i, m in enumerate(MOTORS):
+            want = s[i] + (g[i] - s[i]) * f
+            if m["type"] == "servo":
+                servo_set(i, want); pos[i] = want
+            elif m["type"] == "stepper":
+                need = round(want * m["k"])
+                while steps[i] != need:
+                    up = need > steps[i]; stepper_step(i, up); steps[i] += 1 if up else -1
+                pos[i] = want
+            else:  # DC motor: no feedback, angle is estimated from run time
+                e = want - pos[i]
+                if abs(e) > 1:
+                    dc_set(i, 1 if e > 0 else -1, 1.0); pos[i] += (1 if e > 0 else -1) * m["k"] * dt
+                else:
+                    dc_set(i, 0, 0)
+        if f >= 1.0: break
+        sleep_ms(5)
+    for i, m in enumerate(MOTORS):
+        if m["type"] == "dc": dc_set(i, 0, 0)
+    pos[:] = g
+
+for i, m in enumerate(MOTORS):
+    if m["type"] == "servo": servo_set(i, 0)
+
+${mvf}
+
+MOVES = {${MV.map((v,j)=>`"${nm(v.name).toLowerCase()}": ${I[j]}`).join(', ')}}
+
+if __name__ == "__main__":
+    print("Movements:", ", ".join([${MV.map(v=>`"${nm(v.name)}"`).join(', ')}]))
+    while True:
+        name = input("movement> ").strip().lower()
+        if name in MOVES: MOVES[name]()
+        elif name: print("Unknown movement")
+`}
+function java(){const I=ids(),pins=M.map(P),f=a=>a.join(', ');
+ const mvf=MV.map((v,j)=>`    static void ${I[j]}() throws InterruptedException { moveTo(new double[]{${M.map((m,i)=>v.t[i]==null?'Double.NaN':v.t[i]).join(', ')}}, ${v.ms}); }  // ${nm(v.name)}`).join('\n');
+ const run=MV.length?MV.map((v,j)=>`if (s.equalsIgnoreCase("${nm(v.name)}")) ${I[j]}();`).join('\n            else ')+'\n            else System.out.println("Unknown movement");':'System.out.println("No movements defined");';
+ return `// Generated by SCRAPP-E Motion Designer | board: Raspberry Pi 5 (Pi4J v2, BCM pin numbers)
+// UNTESTED TEMPLATE: check the Pi4J docs for Raspberry Pi 5 support. Servo and DC PWM pins must be
+// hardware-PWM capable (BCM 12, 13, 18, 19) with the PWM overlay enabled in config.txt.
+import com.pi4j.Pi4J;
+import com.pi4j.context.Context;
+import com.pi4j.io.gpio.digital.DigitalOutput;
+import com.pi4j.io.pwm.Pwm;
+import com.pi4j.io.pwm.PwmType;
+import java.util.Scanner;
+
+public class MotionController {
+    static final int N = ${M.length};
+    static final String[] TYPE = {${f(M.map(m=>`"${T3[m.type]}"`))}};  // servo | stepper | dc
+    static final int[][] PINS = {${pins.map(p=>'{'+p.map(x=>pn(x,-1)).join(', ')+'}').join(', ')}};  // servo: signal | stepper: STEP, DIR, EN | dc: PWM, IN1, IN2
+    static final double[] K = {${f(M.map(KV))}};  // servo: range deg | stepper: steps per deg | dc: deg/s at full speed
+    static final double[] LO = {${f(M.map(m=>lim(m)[0]))}}, HI = {${f(M.map(m=>lim(m)[1]))}};
+    static double[] pos = new double[N];
+    static long[] steps = new long[N];
+    static Context pi4j;
+    static Pwm[] pwm = new Pwm[N];
+    static DigitalOutput[][] io = new DigitalOutput[N][3];
+
+    static Pwm hwPwm(int pin, int hz) {
+        return pi4j.create(Pwm.newConfigBuilder(pi4j).id("pwm" + pin).address(pin).pwmType(PwmType.HARDWARE).frequency(hz).initial(0).shutdown(0).build());
+    }
+    static void out(DigitalOutput o, boolean v) { if (o == null) return; if (v) o.high(); else o.low(); }
+    static void spin(long us) { long end = System.nanoTime() + us * 1000; while (System.nanoTime() < end) { } }
+    static void setServo(int i, double a) { double us = 1500 + 1000 * a / (K[i] / 2); pwm[i].on(us / 200.0, 50); }  // duty % of a 20 ms frame
+
+    static void setup() {
+        pi4j = Pi4J.newAutoContext();
+        for (int i = 0; i < N; i++) {
+            int[] p = PINS[i];
+            if (TYPE[i].equals("servo")) { pwm[i] = hwPwm(p[0], 50); setServo(i, 0); }
+            else if (TYPE[i].equals("stepper")) {
+                io[i][0] = pi4j.dout().create(p[0]); io[i][1] = pi4j.dout().create(p[1]);
+                if (p[2] >= 0) { io[i][2] = pi4j.dout().create(p[2]); io[i][2].low(); }  // EN active LOW
+            } else { pwm[i] = hwPwm(p[0], 1000); io[i][1] = pi4j.dout().create(p[1]); io[i][2] = pi4j.dout().create(p[2]); }
+        }
+    }
+
+    // Move every motor to its target angle (NaN = hold) over ms milliseconds.
+    static void moveTo(double[] tgt, long ms) throws InterruptedException {
+        double[] s = pos.clone(), g = new double[N];
+        for (int i = 0; i < N; i++) g[i] = Double.isNaN(tgt[i]) ? pos[i] : Math.max(LO[i], Math.min(HI[i], tgt[i]));
+        long t0 = System.nanoTime(), last = t0;
+        while (true) {
+            long now = System.nanoTime();
+            double f = ms > 0 ? Math.min(1.0, (now - t0) / 1e6 / ms) : 1.0, dt = (now - last) / 1e9;
+            last = now;
+            for (int i = 0; i < N; i++) {
+                double want = s[i] + (g[i] - s[i]) * f;
+                if (TYPE[i].equals("servo")) { setServo(i, want); pos[i] = want; }
+                else if (TYPE[i].equals("stepper")) {
+                    long need = Math.round(want * K[i]);
+                    while (steps[i] != need) {
+                        boolean up = need > steps[i];
+                        out(io[i][1], up); out(io[i][0], true); spin(400); out(io[i][0], false); spin(400);
+                        steps[i] += up ? 1 : -1;
+                    }
+                    pos[i] = want;
+                } else {  // DC motor: no feedback, angle is estimated from run time
+                    double e = want - pos[i];
+                    if (Math.abs(e) > 1) { out(io[i][1], e > 0); out(io[i][2], e < 0); pwm[i].on(100, 1000); pos[i] += (e > 0 ? 1 : -1) * K[i] * dt; }
+                    else { pwm[i].on(0, 1000); out(io[i][1], false); out(io[i][2], false); }
+                }
+            }
+            if (f >= 1.0) break;
+            Thread.sleep(5);
+        }
+        for (int i = 0; i < N; i++) if (TYPE[i].equals("dc")) pwm[i].on(0, 1000);
+        pos = g;
+    }
+
+${mvf}
+
+    public static void main(String[] args) throws Exception {
+        setup();
+        System.out.println("Type a movement name:");
+        Scanner in = new Scanner(System.in);
+        while (in.hasNextLine()) {
+            String s = in.nextLine().trim();
+            ${run}
+        }
+    }
+}
+`}
+function warn(bd){const w=[],seen={},R={uno:[0,19],mega:[0,69],esp32:[0,39],esp32s3:[0,48],pi5:[2,27]}[bd];
+ M.forEach(m=>PINS[m.type].forEach(k=>{const raw=((m.pins[k]||'')+'').trim();if(!raw){if(k!='en')w.push(`${m.name}: ${k} pin is empty`);return}
+  const n=+raw;if(isNaN(n)){if(!(/^A\d+$/i.test(raw)&&(bd=='uno'||bd=='mega')))w.push(`${m.name}: pin "${raw}" isn't valid for this board`)}
+  else{if(n<R[0]||n>R[1])w.push(`${m.name}: pin ${n} is outside ${BN[bd]}'s range (${R[0]}–${R[1]})`);
+   if(bd=='esp32'&&((n>=6&&n<=11)||n>=34))w.push(`${m.name}: ESP32 GPIO ${n} is reserved for flash or input-only`);
+   if(bd=='esp32s3'&&n>=26&&n<=37)w.push(`${m.name}: ESP32-S3 GPIO ${n} is used by flash/PSRAM on many modules`)}
+  if(seen[raw])w.push(`Pin ${raw} is used by both ${seen[raw]} and ${m.name}`);seen[raw]=m.name}));return w}
+const NOTE={uno:'Servo library for servos. A DC motor PWM pin must support analogWrite (Uno: 3, 5, 6, 9, 10, 11).',mega:'Servo library for servos. A DC motor PWM pin must support analogWrite (Mega: 2–13, 44–46).',esp32:'Install the ESP32Servo library; analogWrite needs arduino-esp32 core 3.x.',esp32s3:'Install the ESP32Servo library; analogWrite needs arduino-esp32 core 3.x.',pi5:'BCM pin numbers. Software timing makes servos and steppers jitter a little; prefer hardware PWM pins (12, 13, 18, 19) for servos.'};
+let ext='ino';
+function gen(){const bd=$('bd').value,lg=$('lg').value;let msg='',code='';
+ if(!M.length)msg='Add at least one motor first.';
+ else if(lg=='cpp'&&bd=='pi5')msg="C++ on the Raspberry Pi 5 isn't generated (it needs libgpiod). Choose Python or Java for the Pi 5.";
+ else if(lg=='python'&&(bd=='uno'||bd=='mega'))msg="Arduino Uno/Mega can't run Python. Choose C++ for them.";
+ else if(lg=='java'&&bd!='pi5')msg='Java is only generated for the Raspberry Pi 5 (Pi4J). Choose C++ for Arduino/ESP32 or Python for ESP32.';
+ else{code=lg=='cpp'?cpp(bd):lg=='python'?py(bd):java();ext=lg=='cpp'?'ino':lg=='python'?'py':'java'}
+ $('cw').innerHTML=(msg?`<div class="bad">${esc(msg)}</div>`:'')+(code?warn(bd).map(x=>`<div class="warn">⚠ ${esc(x)}</div>`).join('')+`<div>${esc(lg=='python'&&bd.startsWith('esp')?'Flash MicroPython onto the board and save this file as main.py.':NOTE[bd])} DC motors have no position feedback, so set “°/s at full speed” by measuring yours; steppers can lose steps if driven too fast.</div>`:'');$('co').value=code}
+$('gn').onclick=gen;
+$('cp').onclick=()=>{$('co').select();navigator.clipboard&&navigator.clipboard.writeText($('co').value)};
+$('dw').onclick=()=>{if(!$('co').value)gen();if(!$('co').value)return;const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([$('co').value]));a.download=ext=='java'?'MotionController.java':'motion.'+ext;a.click()};
+const SL={coincident:['Face 1: flat face on the fixed part','Face 2: flat face on the moving part'],distance:['Face 1: flat face on the fixed part','Face 2: flat face on the moving part'],concentric:['Face 1: cylinder on the fixed part','Face 2: cylinder on the moving part'],hinge:['Face 1: cylinder on the fixed part (pin or hole)','Face 2: cylinder on the moving part','Stop face on the fixed part (optional)','Stop face on the moving part (optional)']};
+const KIND={coincident:['plane','plane'],distance:['plane','plane'],concentric:['cyl','cyl'],hinge:['cyl','cyl','plane','plane']};
+const MN={coincident:'Coincident',distance:'Distance',concentric:'Concentric',hinge:'Hinge'};
+const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2],cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]],nz=a=>{const l=Math.hypot(...a)||1;return a.map(x=>x/l)};
+const dsc=d=>d.kind=='plane'?`flat face on ${d.part}`:`${d.hole?'hole':'pin'} Ø${(d.r*2).toFixed(2)} on ${d.part}`;
+function prep(p){if(p.adj)return;const a=p.pos,n=a.length/9,bb=p.geo.boundingBox,q=bb.max.distanceTo(bb.min)*1e-5||1e-6,ids=new Map(),tv=new Int32Array(n*3);
+ for(let i=0;i<n*3;i++){const k=Math.round(a[i*3]/q)+','+Math.round(a[i*3+1]/q)+','+Math.round(a[i*3+2]/q);let v=ids.get(k);if(v==null){v=ids.size;ids.set(k,v)}tv[i]=v}
+ const em=new Map(),nr=new Float32Array(n*3),ct=new Float32Array(n*3),ar=new Float32Array(n);
+ for(let t=0;t<n;t++){const o=t*9,ux=a[o+3]-a[o],uy=a[o+4]-a[o+1],uz=a[o+5]-a[o+2],vx=a[o+6]-a[o],vy=a[o+7]-a[o+1],vz=a[o+8]-a[o+2],cx=uy*vz-uz*vy,cy=uz*vx-ux*vz,cz=ux*vy-uy*vx,l=Math.hypot(cx,cy,cz)||1;
+  nr[t*3]=cx/l;nr[t*3+1]=cy/l;nr[t*3+2]=cz/l;ar[t]=l/2;ct[t*3]=(a[o]+a[o+3]+a[o+6])/3;ct[t*3+1]=(a[o+1]+a[o+4]+a[o+7])/3;ct[t*3+2]=(a[o+2]+a[o+5]+a[o+8])/3;
+  for(let k=0;k<3;k++){const x=tv[t*3+k],y=tv[t*3+(k+1)%3],key=x<y?x+'_'+y:y+'_'+x;if(!em.has(key))em.set(key,[]);em.get(key).push(t)}}
+ const adj=Array.from({length:n},()=>[]);em.forEach(l=>{if(l.length==2){adj[l[0]].push(l[1]);adj[l[1]].push(l[0])}});Object.assign(p,{adj,nr,ct,ar,tol:q*100})}
+function grow(p,t0,ok){const seen=new Set([t0]),q=[t0];for(let h=0;h<q.length&&q.length<8000;h++){const t=q[h];for(const u of p.adj[t])if(!seen.has(u)&&ok(t,u)){seen.add(u);q.push(u)}}return q}
+const nd=(p,a,b)=>p.nr[a*3]*p.nr[b*3]+p.nr[a*3+1]*p.nr[b*3+1]+p.nr[a*3+2]*p.nr[b*3+2];
+function planeOf(p,tr,t0){let A=0,x=0,y=0,z=0;tr.forEach(t=>{A+=p.ar[t];x+=p.ct[t*3]*p.ar[t];y+=p.ct[t*3+1]*p.ar[t];z+=p.ct[t*3+2]*p.ar[t]});return{part:p.name,kind:'plane',n:[p.nr[t0*3],p.nr[t0*3+1],p.nr[t0*3+2]],p:[x/A,y/A,z/A],tris:tr}}
+function solve3(M,b){const d=m=>m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1])-m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0])+m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]),D=d(M);if(Math.abs(D)<1e-12)return null;return[0,1,2].map(k=>d(M.map((r,i)=>r.map((x,j)=>j==k?b[i]:x)))/D)}
+function cylOf(p,tr){const C=[0,0,0,0,0,0],S=[0,0,0],N=tr.length;
+ tr.forEach(t=>{const x=p.nr[t*3],y=p.nr[t*3+1],z=p.nr[t*3+2];C[0]+=x*x;C[1]+=x*y;C[2]+=x*z;C[3]+=y*y;C[4]+=y*z;C[5]+=z*z;S[0]+=x;S[1]+=y;S[2]+=z});
+ if(Math.hypot(...S)/N>.985)return null;
+ const T=C[0]+C[3]+C[5],mul=v=>[C[0]*v[0]+C[1]*v[1]+C[2]*v[2],C[1]*v[0]+C[3]*v[1]+C[4]*v[2],C[2]*v[0]+C[4]*v[1]+C[5]*v[2]];
+ let a=nz([.3,.5,.8]);for(let k=0;k<80;k++){const m=mul(a);a=nz([T*a[0]-m[0],T*a[1]-m[1],T*a[2]-m[2]])}
+ if(dot(a,mul(a))/N>.02)return null;
+ const u=nz(cross(a,Math.abs(a[0])<.9?[1,0,0]:[0,1,0])),w=cross(a,u),P=tr.map(t=>[p.ct[t*3],p.ct[t*3+1],p.ct[t*3+2]]),xs=P.map(q=>dot(q,u)),ys=P.map(q=>dot(q,w)),mx=xs.reduce((s,v)=>s+v)/N,my=ys.reduce((s,v)=>s+v)/N,Sm=[[0,0,0],[0,0,0],[0,0,0]],B=[0,0,0];
+ xs.forEach((X,i)=>{const x=X-mx,y=ys[i]-my,r=[2*x,2*y,1],b=x*x+y*y;for(let i2=0;i2<3;i2++){B[i2]+=r[i2]*b;for(let j=0;j<3;j++)Sm[i2][j]+=r[i2]*r[j]}});
+ const th=solve3(Sm,B);if(!th)return null;const rad=Math.sqrt(th[2]+th[0]*th[0]+th[1]*th[1]);if(!(rad>0))return null;
+ const ax=P.reduce((s,q)=>s+dot(q,a),0)/N,cx=mx+th[0],cy=my+th[1],ctr=[0,1,2].map(k=>u[k]*cx+w[k]*cy+a[k]*ax);let out=0;
+ tr.forEach((t,i)=>{out+=dot([P[i][0]-ctr[0],P[i][1]-ctr[1],P[i][2]-ctr[2]],[p.nr[t*3],p.nr[t*3+1],p.nr[t*3+2]])});
+ return{part:p.name,kind:'cyl',n:a,p:ctr,r:rad,hole:out<0,tris:tr}}
+function faceAt(p,t0){prep(p);const c=p.ct,n=p.nr;
+ const pl=grow(p,t0,(t,u)=>nd(p,t0,u)>.99985&&Math.abs((c[u*3]-c[t0*3])*n[t0*3]+(c[u*3+1]-c[t0*3+1])*n[t0*3+1]+(c[u*3+2]-c[t0*3+2])*n[t0*3+2])<p.tol);
+ if(pl.length>2)return planeOf(p,pl,t0);
+ const sm=grow(p,t0,(t,u)=>nd(p,t,u)>.82);return(sm.length>=6&&cylOf(p,sm))||planeOf(p,pl,t0)}
+function pickFace(h){const part=h.object.userData.part;if(!part)return;const d=faceAt(part,h.faceIndex),want=KIND[$('mty').value][faceSlot],nm=k=>k=='plane'?'flat':'cylindrical';
+ if(d.kind!=want){$('mm').textContent=`That face is ${nm(d.kind)}; this slot needs a ${nm(want)} face. Try another.`;return}
+ slots[faceSlot]=d;faceSlot=-1;if(ren)ren.domElement.style.cursor='';$('mm').textContent='';msl();rebuild()}
+function solve(){if(!window.THREE||!parts.length)return;const V=THREE,pOf=n=>parts.find(p=>p.name==n);parts.forEach(p=>p.xf.identity());
+ const W=d=>{const p=d&&pOf(d.part);return p?{n:new V.Vector3(...d.n).transformDirection(p.xf),p:new V.Vector3(...d.p).applyMatrix4(p.xf)}:null};
+ const mv=(part,pt,Q,t)=>{part.xf.premultiply(new V.Matrix4().makeTranslation(t.x,t.y,t.z).multiply(new V.Matrix4().makeTranslation(pt.x,pt.y,pt.z)).multiply(new V.Matrix4().makeRotationFromQuaternion(Q)).multiply(new V.Matrix4().makeTranslation(-pt.x,-pt.y,-pt.z)))};
+ mates.forEach(x=>{const B=pOf(x.b.part),A=W(x.a),b=W(x.b);if(!B||!A||!b)return;
+  if(x.type=='coincident'||x.type=='distance'){const tg=x.flip?A.n.clone():A.n.clone().negate(),Q=new V.Quaternion().setFromUnitVectors(b.n,tg),d=x.type=='distance'?x.off:0;
+   mv(B,b.p,Q,A.n.clone().multiplyScalar(d-b.p.clone().sub(A.p).dot(A.n)))}
+  else{const s=Math.sign(b.n.dot(A.n))||1,Q=new V.Quaternion().setFromUnitVectors(b.n,A.n.clone().multiplyScalar(s)),r=A.p.clone().sub(b.p);mv(B,b.p,Q,r.sub(A.n.clone().multiplyScalar(r.dot(A.n))));
+   if(x.type=='hinge'&&x.c&&x.d){const pa=W(x.c),pb=W(x.d);if(pa&&pb){const den=pa.n.dot(A.n);if(Math.abs(den)>.1)mv(B,new V.Vector3(),new V.Quaternion(),A.n.clone().multiplyScalar((pa.p.clone().sub(pb.p).dot(pa.n)+x.off)/den))}}}});
+ mates.forEach(x=>{x.joint=null;if(x.type!='hinge')return;const A=W(x.a),B=pOf(x.b.part);if(!A||!B)return;
+  const c=B.geo.boundingBox.clone().applyMatrix4(B.xf).getCenter(new V.Vector3()),p=A.p.clone().add(A.n.clone().multiplyScalar(c.clone().sub(A.p).dot(A.n)));
+  x.joint={axis:A.n.toArray().map(v=>+v.toFixed(5)),point:p.toArray().map(v=>+v.toFixed(2))}});
+ M.forEach(m=>{const x=mates.find(y=>y.id==m.mate);if(x&&x.joint){m.ax=x.joint.axis.slice();m.pivot=x.joint.point.slice()}});rebuild()}
+function msl(){const t=$('mty').value;slots=slots.slice(0,SL[t].length);
+ $('ms').innerHTML=SL[t].map((l,k)=>`<div class="row" style="align-items:center;margin:4px 0"><button class="sm ghost" data-s="${k}">Pick</button><span class="n">${l}: <b>${slots[k]?esc(dsc(slots[k])):'none'}</b></span></div>`).join('')}
+function mtl(){$('mtab').innerHTML=mates.length?'<tr><th>Mate</th><th>Fixed → moving</th><th></th></tr>'+mates.map((x,j)=>`<tr><td>${esc(x.name)}</td><td>${esc(x.a.part)} → ${esc(x.b.part)}</td><td>${x.type=='hinge'?`<button class="sm" data-a="mm" data-j="${j}">${M.some(m=>m.mate==x.id)?'Motor linked':'Make motor'}</button> `:''}<button class="sm ghost" data-a="md" data-j="${j}">Delete</button></td></tr>`).join(''):'<tr><td class="n">No mates yet.</td></tr>'}
+$('mty').onchange=()=>{slots=[];faceSlot=-1;msl();rebuild()};
+$('ms').onclick=e=>{const k=e.target.dataset.s;if(k==null)return;faceSlot=+k;pick=false;if(ren)ren.domElement.style.cursor='crosshair';$('mm').textContent='Click a '+(KIND[$('mty').value][k]=='plane'?'flat':'cylindrical')+' face on the model.'};
+$('mad').onclick=()=>{const t=$('mty').value;if(!slots[0]||!slots[1]){$('mm').textContent='Pick both faces first.';return}
+ if(slots[0].part==slots[1].part){$('mm').textContent='Pick faces on two different parts.';return}
+ const cl=d=>d?JSON.parse(JSON.stringify({...d,tris:undefined})):undefined;
+ mates.push({id:mid++,type:t,name:MN[t]+' '+(mates.filter(x=>x.type==t).length+1),a:cl(slots[0]),b:cl(slots[1]),c:cl(slots[2]),d:cl(slots[3]),off:+$('mof').value||0,flip:$('mfl').checked});
+ slots=[];$('mm').textContent='';msl();solve();mtl()};
+$('mcl').onclick=()=>{if(mates.length&&!confirm('Remove all mates?'))return;mates=[];M.forEach(m=>{delete m.mate});solve();mtl()};
+$('mtab').onclick=e=>{const a=e.target.dataset.a,j=+e.target.dataset.j,x=mates[j];if(!a||!x)return;
+ if(a=='md'){mates.splice(j,1);M.forEach(m=>{if(m.mate==x.id)delete m.mate});solve();mtl()}
+ if(a=='mm'&&x.joint&&!M.some(m=>m.mate==x.id)){M.push({name:x.name.replace('Hinge','Joint'),type:'servo180',part:x.b.part,parent:M.findIndex(m=>m.part==x.a.part),axis:'custom',ax:x.joint.axis.slice(),pivot:x.joint.point.slice(),min:-90,max:90,pins:{},micro:16,gear:1,dps:90,mate:x.id});
+  ang.push(0);MV.forEach(v=>v.t.push(null));sel=M.length-1;mui();rebuild();mtl()}};
+window.motionAPI={get:()=>({M,MV,mates,bd:$('bd').value,lg:$('lg').value}),set:d=>{M=d.M||[];MV=d.MV||[];mates=d.mates||[];mid=mates.reduce((a,x)=>Math.max(a,x.id),0)+1;slots=[];ang=M.map(()=>0);sel=0;if(d.bd)$('bd').value=d.bd;if(d.lg)$('lg').value=d.lg;mui();rebuild();solve();mtl();msl()}};
+init3d();addEventListener('resize',()=>{if(ren){const w=$('mv').clientWidth;ren.setSize(w,400);cam.aspect=w/400;cam.updateProjectionMatrix()}});
+mui();msl();mtl();
+})();
+</script>
+<script>
+window.PAGE={type:'motion',capture:()=>motionAPI.get(),apply:d=>motionAPI.set(d)};
+</script>
+</body></html>
