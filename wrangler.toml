@@ -1,0 +1,7 @@
+name = "scrappe-ai-3d"
+main = "worker.js"
+compatibility_date = "2026-11-01"
+
+[vars]
+# Sites allowed to call the worker (comma-separated, no trailing slash).
+ALLOWED_ORIGIN = "https://kaitlynngarrigus.github.io"
